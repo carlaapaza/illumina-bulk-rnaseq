@@ -5,12 +5,13 @@ date: "2025-10-17"
 output: html_document
 ---
 
+# set up
 ```{r}
 library(tidyverse)
 library(tximport)
 library(tibble)
-library(rtracklayer)      
-library(GenomicFeatures)
+library(rtracklayer)      # importación del GTF
+library(GenomicFeatures)  # TxDb y cálculo de longitudes
 library(GenomicRanges)
 library(DESeq2)
 library(dplyr)
@@ -28,6 +29,8 @@ library(circlize)
 library(grid)
 library(viridis)
 library(readxl)
+library(ggraph)
+library(igraph)
 ```
 
 
@@ -749,7 +752,6 @@ ranks_use <- ranks[valid_ids]
 
 ## generate gsea df
 ```{r}
-
 set.seed(123)
 
 fgsea_go <- fgsea(
@@ -772,7 +774,7 @@ fgsea_go_sig <- fgsea_go_df %>%
   filter(padj < 0.05 & (NES > 1 | NES < -1))
 
 write.xlsx(fgsea_go_df, 
-          file = "./results/2_gsea/tables/GSEA_A_vs_B.xlsx")
+          file = "./results/2_gsea/tables/GSEA_B_vs_C.xlsx")
 ```
 
 
@@ -789,58 +791,43 @@ nodes <- fgsea_go_sig %>%
   ) %>%
   distinct()
 
-# Try to attach human-readable GO term names; fall back to GO ID
+# Human-readable GO names
 term_map <- tibble(pathway = nodes$pathway,
                    term = AnnotationDbi::Term(nodes$pathway))
 nodes <- nodes %>%
   left_join(term_map, by = "pathway") %>%
   mutate(term = ifelse(is.na(term) | term == "", pathway, term))
 
-## 2) Build pathway–pathway edges by Jaccard overlap of member genes
-# Collect member genes for selected pathways
+## 2) Build pathway–pathway edges by Jaccard overlap
 gs_sel <- pathways_GO_BP[nodes$pathway]
 
-# Pairwise overlaps
 comb_idx <- combn(seq_along(gs_sel), 2)
-edge_list <- map_dfr(seq_len(ncol(comb_idx)), function(k) {
+edge_list <- purrr::map_dfr(seq_len(ncol(comb_idx)), function(k) {
   i <- comb_idx[1, k]; j <- comb_idx[2, k]
   gi <- unique(gs_sel[[i]]); gj <- unique(gs_sel[[j]])
   if (length(gi) == 0 || length(gj) == 0) return(NULL)
   inter <- length(intersect(gi, gj))
   uni   <- length(union(gi, gj))
   if (uni == 0) return(NULL)
-  jacc  <- inter / uni
   tibble(from = names(gs_sel)[i], to = names(gs_sel)[j],
-         overlap = inter, jaccard = jacc)
+         overlap = inter, jaccard = inter / uni)
 })
 
-# Keep non-trivial edges (tune the threshold as needed)
 jacc_threshold <- 0.10
-edges <- edge_list %>%
-  filter(jaccard >= jacc_threshold)
-```
+edges <- edge_list %>% filter(jaccard >= jacc_threshold)
 
-
-```{r}
 # -------------------------------
 # 1. Filter and prune the edges
 # -------------------------------
-
-# Keep strongest connections per node
 deg_limit <- 20
 
 edges_pruned <- dplyr::bind_rows(
-  edges %>%
-    dplyr::group_by(from) %>%
-    dplyr::slice_max(jaccard, n = deg_limit, with_ties = FALSE),
-  edges %>%
-    dplyr::group_by(to) %>%
-    dplyr::slice_max(jaccard, n = deg_limit, with_ties = FALSE)
+  edges %>% group_by(from) %>% slice_max(jaccard, n = deg_limit, with_ties = FALSE),
+  edges %>% group_by(to)   %>% slice_max(jaccard, n = deg_limit, with_ties = FALSE)
 ) %>%
-  dplyr::distinct(from, to, .keep_all = TRUE) %>%
-  dplyr::arrange(desc(jaccard))
+  distinct(from, to, .keep_all = TRUE) %>%
+  arrange(desc(jaccard))
 
-# Optional: impose a hard cap on total edges
 max_edges <- 1200
 if (nrow(edges_pruned) > max_edges) {
   edges_pruned <- edges_pruned %>% slice_head(n = max_edges)
@@ -849,10 +836,8 @@ if (nrow(edges_pruned) > max_edges) {
 # -------------------------------
 # 2. Create the graph
 # -------------------------------
-
 g <- igraph::graph_from_data_frame(edges_pruned, vertices = nodes, directed = FALSE)
 
-# Remove loops and duplicates, preserving attributes
 g <- igraph::simplify(
   g,
   remove.multiple = TRUE,
@@ -864,79 +849,69 @@ g <- igraph::simplify(
   )
 )
 
-# Remove isolated nodes (those with no connections)
+# Drop isolated vertices
 g <- igraph::delete.vertices(g, which(igraph::degree(g) == 0))
 
 # -------------------------------
-# 3. Compute layout (fixed for reproducibility)
+# 3. Compute layout (reproducible)
 # -------------------------------
-
 set.seed(7)
 layout_fr <- igraph::layout_with_fr(g, niter = 2000)
-V(g)$x <- layout_fr[, 1]
-V(g)$y <- layout_fr[, 2]
+igraph::V(g)$x <- layout_fr[, 1]
+igraph::V(g)$y <- layout_fr[, 2]
 
 # -------------------------------
 # 4. Plot (publication-ready)
 # -------------------------------
-
-# Node size reflects the number of genes in each GO term
-# (assuming column 'size' = number of member genes)
-
-p <- ggraph(g, layout = "manual", x = V(g)$x, y = V(g)$y) +
+p <- ggraph(g, layout = "manual", x = igraph::V(g)$x, y = igraph::V(g)$y) +
   geom_edge_link0(aes(width = jaccard),
                   colour = "grey70", alpha = 0.5, show.legend = TRUE) +
   geom_node_point(aes(size = minus_log10FDR, colour = NES)) +
-  geom_node_text(aes(label = term),
-                 size = 3, repel = TRUE, vjust = 0.5, hjust = 0.5) +
+  geom_node_text(aes(label = term), size = 5, repel = TRUE,
+                 vjust = 0.5, hjust = 0.5) +
   scale_edge_width(range = c(0.2, 1.4), name = "Jaccard") +
   scale_size_continuous(name = "-log10(FDR)") +
   scale_color_gradient2(low = "#4a4e69", mid = "grey80",
                         high = "#9a031e", midpoint = 0, name = "NES") +
   theme_bw() +
   theme(
-    legend.title = element_text(size = 16),
+    legend.title = element_text(size = 14),
     legend.text  = element_text(size = 14),
     axis.text    = element_blank(),
     axis.title   = element_blank(),
     axis.ticks   = element_blank(),
     panel.grid   = element_blank(),
-    plot.title   = element_blank(),
-    panel.border = element_blank()
+    panel.border = element_blank(),
+    plot.title   = element_blank()
   )
 
 p
+
+# Save
 outdir <- "/Volumes/Carlita/carla/mirkos-lab/01-PigBrainNCC/FinalAnalysis/results/2_gsea/figures"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 
-ggsave(
-  filename = file.path(outdir, "GO_BP_network_A_vs_B.svg"),
-  plot = p,
-  width = 10,
-  height = 8
-)
-
-ggsave(
-  filename = file.path(outdir, "GO_BP_network_A_vs_B.png"),
-  plot = p,
-  width = 10,
-  height = 8,
-  dpi = 400
-)
+ggsave(file.path(outdir, "GO_BP_network_B_vs_C.svg"), p, width = 16, height = 12)
+ggsave(file.path(outdir, "GO_BP_network_B_vs_C.png"), p, width = 16, height = 12, dpi = 400)
 ```
 
 ## heatmap
 
 ```{r}
 # save 700 x 900 in
-# go_id <- "GO:0001570" # vasculogenesis
-# go_id    <- "GO:0048514" # blood vessel morphogenesis
-go_id <- "GO:0034097" # response to cytokine
+# go_id <- "GO:0001570" # vasculogenesis - trtmnt
+# go_id    <- "GO:0048514" # blood vessel morphogenesis - trtmnt
+# go_id <- "GO:0034097" # response to cytokine - trtmnt
+# go_id <- "GO:0006959" # humoral immune response - inf
+go_id <- "GO:0006909" #phagocytosis
+ 
 
 
 col_up   <- "#8b1e3f"
 col_down <- "#22577a"
 z_cap    <- 2
 group_cols <- c("Treated"="gray15","Untreated"="gray60")
+group_cols <- c("Infected"="gray60", "Uninfected"="gray75")
 # --------------------------------
 
 vst_mat <- assay(vst(dds, blind = FALSE))
@@ -958,16 +933,16 @@ meta <- as.data.frame(colData(dds))
 ann <- meta |>
   mutate(classification = factor(as.character(classification),
                                  levels=c("A","B","C"),
-                                 labels=c("Treated","Untreated","Control"))) |>
+                                 labels=c("Treated","Infected","Uninfected"))) |>
   transmute(sample = rownames(meta), classification)
 
-keep_ab <- ann$classification %in% c("Treated","Untreated")
+keep_ab <- ann$classification %in% c("Infected","Uninfected")
 ann_ab  <- ann[keep_ab, , drop = FALSE]
 mat_ab  <- mat_all[, ann_ab$sample, drop = FALSE]
 
 grp <- droplevels(ann_ab$classification)
-treated_idx   <- grp == "Treated"
-untreated_idx <- grp == "Untreated"
+treated_idx   <- grp == "Infected"
+untreated_idx <- grp == "Uninfected"
 
 lfc_tbl <- tibble(
   gene = rownames(mat_ab),
@@ -976,8 +951,8 @@ lfc_tbl <- tibble(
 ) |>
   mutate(lfc = mean_treated - mean_untreated)
 
-top_up   <- lfc_tbl |> slice_max(lfc, n=20, with_ties=FALSE)
-top_down <- lfc_tbl |> slice_min(lfc, n=20, with_ties=FALSE)
+top_up   <- lfc_tbl |> slice_max(lfc, n=30, with_ties=FALSE)
+top_down <- lfc_tbl |> slice_min(lfc, n=30, with_ties=FALSE)
 row_order <- bind_rows(top_up, top_down) |> arrange(desc(lfc)) |> pull(gene)
 
 mat_top <- mat_ab[row_order, , drop = FALSE]
@@ -987,7 +962,7 @@ mat_top_z <- scale_rows(mat_top)
 mat_top_z[mat_top_z >  z_cap] <-  z_cap
 mat_top_z[mat_top_z < -z_cap] <- -z_cap
 
-group_factor <- factor(ann_ab$classification, levels=c("Treated","Untreated"))
+group_factor <- factor(ann_ab$classification, levels=c("Infected","Uninfected"))
 names(group_factor) <- ann_ab$sample
 
 top_annot <- HeatmapAnnotation(
@@ -1064,7 +1039,7 @@ p <- ggplot(fgsea_go_sig,
   )
 
 
-outfile_base <- "/Volumes/Carlita/carla/mirkos-lab/01-PigBrainNCC/FinalAnalysis/results/2_gsea/figures/dotplot_A_vs_B"
+outfile_base <- "/Volumes/Carlita/carla/mirkos-lab/01-PigBrainNCC/FinalAnalysis/results/2_gsea/figures/dotplot_B_vs_C"
 
 ggsave(
   filename = paste0(outfile_base, ".png"),
@@ -1085,5 +1060,80 @@ ggsave(
 ```
 
 
+```{r}
+# Crear columna de panel según el signo de NES
+fgsea_go_sig <- fgsea_go_sig %>%
+  mutate(
+    Regulation = ifelse(NES > 0, "Upregulated", 
+                        "Downregulated")
+  )
 
+# Ordenar términos por FDR dentro de cada panel
+fgsea_go_sig <- fgsea_go_sig %>%
+  group_by(Regulation) %>%
+  mutate(term = reorder_within(term, log10FDR, Regulation)) %>%
+  ungroup()
 
+# Si no tienes tidytext, puedes definir reorder_within manualmente:
+reorder_within <- function(x, by, within, fun = mean, sep = "___", ...) {
+  new_x <- paste(x, within, sep = sep)
+  stats::reorder(new_x, by, FUN = fun)
+}
+
+scale_y_reordered <- function(..., sep = "___") {
+  ggplot2::scale_y_discrete(labels = function(x) gsub(paste0(sep, ".+$"), "", x), ...)
+}
+
+# Plot dividido en dos paneles sin espacios vacíos
+p <- ggplot(fgsea_go_sig,
+  aes(
+    x    = log10FDR,
+    y    = term,
+    fill = NES,
+    size = size
+  )
+) +
+  geom_point(shape = 21, color = "black") +
+  facet_wrap(~Regulation, scales = "free_y", ncol = 2) +
+  scale_y_reordered() +
+  scale_size_binned(name = "setSize", guide = guide_legend(label = TRUE)) +
+  scale_fill_gradientn(
+    colors = c("#22577a", "gray95", "#8b1e3f"),
+    name = "NES"
+  ) +
+  labs(
+    x = expression(-log[10]~FDR),
+    y = "Biological Process",
+    fill = "NES",
+    size = "Size"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    strip.background = element_rect(fill = "white", color = NA),
+    strip.text = element_text(size = 16, color = "#333333"),
+    axis.text.x = element_text(color = "gray4", size = 14),
+    axis.text.y = element_text(color = "gray4", size = 10),
+    axis.title = element_text(size = 16),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14),
+    panel.grid = element_blank()
+  )
+
+ggsave(
+  filename = paste0(outfile_base, ".png"),
+  plot = p,
+  width = 20, height = 8.75, units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = paste0(outfile_base, ".svg"),
+  plot = p,
+  width = 20, height = 8.75, units = "in",
+  device = "svg", 
+  bg = "transparent"
+)
+
+```
